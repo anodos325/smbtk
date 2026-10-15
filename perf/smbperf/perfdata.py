@@ -48,7 +48,9 @@ class Profile:
     comm id, event id, weight, stack id, aux); stacks are frame ids, root
     first; a frame is (name, dso, kind). For sched_switch the weight is
     the time off the CPU (-1 when the task was not seen back) and aux the
-    state it left in; for sys_enter aux is the syscall number."""
+    state it left in: the tracepoint's prev_state, or "R" when that is
+    missing and perf's switch-out record says preempt; for sys_enter aux
+    is the syscall number."""
 
     def __init__(self) -> None:
         self.frames: list[tuple[str, str, int]] = []
@@ -110,6 +112,10 @@ def parse(lines: Iterable[str]) -> Profile:
     event_ids: dict[str, int] = {}
     header: list[str] = []
     switch_in: dict[int, list[int]] = {}
+    # Each thread's latest switch-out sample with no state: perf built
+    # without libtraceevent prints no tracepoint fields, but its switch
+    # record still says whether the thread was preempted.
+    pending: dict[int, list] = {}
     cur: tuple | None = None
     frames: list[int] = []
 
@@ -147,6 +153,8 @@ def parse(lines: Iterable[str]) -> Profile:
             prof.stacks.append(stack)
         t, pid, tid, comm, ev, period, aux = cur
         prof.samples.append((t, pid, tid, comm, ev, period, sid, aux))
+        if ev == event_ids.get(SWITCH) and not aux[0]:
+            pending[tid] = aux
         cur = None
         frames = []
 
@@ -180,9 +188,14 @@ def parse(lines: Iterable[str]) -> Profile:
         rest = m["rest"]
         if rest.startswith("PERF_RECORD_"):
             parts = rest.split()
-            if parts[0].startswith("PERF_RECORD_SWITCH") and \
-                    len(parts) > 1 and parts[1] == "IN":
-                switch_in.setdefault(tid, []).append(t)
+            if parts[0].startswith("PERF_RECORD_SWITCH") and len(parts) > 1:
+                if parts[1] == "IN":
+                    switch_in.setdefault(tid, []).append(t)
+                    pending.pop(tid, None)
+                elif parts[1] == "OUT":
+                    left = pending.pop(tid, None)
+                    if left is not None and parts[2:3] == ["preempt"]:
+                        left[0] = "R"
             continue
         em = _EVENT.match(rest)
         if em is None:

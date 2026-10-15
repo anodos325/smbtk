@@ -80,7 +80,9 @@ time goes to the nearest exported function.
 - **Off-CPU.** `[preempted]` marks time runnable but not running,
   `[uninterruptible]` time in D state (disk, some locks); idle
   io_uring workers and the event loop's `epoll_wait` are smbd waiting
-  for work.
+  for work. `[preempted]` is read from perf's switch records, so it
+  survives a perf built without libtraceevent (TrueNAS ships one),
+  which prints no tracepoint fields; `[uninterruptible]` needs them.
 - **Frames.** Kernel functions end in `_[k]`, as stackcollapse-perf.pl
   marks them; inlined functions are frames of their own. In the SVG the
   kernel is orange, kernel modules (ZFS, SPL) teal, user code red to

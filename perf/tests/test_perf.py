@@ -275,6 +275,45 @@ def test_off_cpu_time_from_switch_records():
     assert clipped.total() == 1_000_000 + 500_000 + 2_000_000 + 7_000_000
 
 
+def test_off_cpu_preempted_from_switch_records_without_tracepoint_text():
+    """perf built without libtraceevent prints no sched_switch fields;
+    its switch-out records still say whether the thread was preempted."""
+    c = "smbd[10.0.0.1]"
+    sched = [K("__traceiter_sched_switch"), K("__schedule"), K("schedule")]
+
+    def out(t, frames):
+        return sample(c, 100, 100, t, 1, "sched:sched_switch", sched + frames)
+
+    def wide(t, direction):
+        return (f"{c} 100/100 {t:.9f}: PERF_RECORD_SWITCH_CPU_WIDE "
+                f"{direction}  {'prev' if direction == 'IN' else 'next'} "
+                "pid/tid:   200/200\n")
+
+    sleep = [K("do_nanosleep")]
+    text = "".join([
+        out(2000.000, [K("exit_to_user_mode_loop")]),
+        switch(c, 100, 100, 2000.00001, "OUT preempt"),
+        switch(c, 100, 100, 2000.0005, "IN"),
+        out(2000.001, [K("do_epoll_wait"), U("epoll_wait", "libc.so.6")]),
+        switch(c, 100, 100, 2000.00101, "OUT"),
+        switch(c, 100, 100, 2000.003, "IN"),
+        out(2000.004, sleep),               # its switch-out record was lost
+        switch(c, 100, 100, 2000.005, "IN"),
+        out(2000.006, sleep),
+        wide(2000.00601, "OUT preempt"),
+        wide(2000.007, "IN"),
+        out(2000.008, sleep),
+        wide(2000.00801, "OUT"),
+        wide(2000.009, "IN"),
+    ])
+    assert lines(fold(text)) == {
+        "smbd[10.0.0.1];exit_to_user_mode_loop_[k];[preempted]": 500_000,
+        "smbd[10.0.0.1];epoll_wait;do_epoll_wait_[k]": 2_000_000,
+        "smbd[10.0.0.1];do_nanosleep_[k]": 2_000_000,
+        "smbd[10.0.0.1];do_nanosleep_[k];[preempted]": 1_000_000,
+    }
+
+
 def test_off_cpu_without_switch_records_uses_next_pid():
     text = "".join(
         sample("t", 5, 5, t, 1, "sched:sched_switch",
