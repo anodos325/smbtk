@@ -13,6 +13,8 @@ folded stacks also work with flamegraph.pl, inferno and speedscope.
 | `smb-perf-fold`    | folded stacks for other tools                               |
 | `smb-perf-stat`    | CPU time, cycles, instructions of smbd over a workload      |
 | `smb-perf-compare` | A/B table of `smb-perf-stat` runs                           |
+| `smb-perf-disk`    | the storage under the shares: pools, vdevs, disks, ARC, ZIL, datasets, I/O |
+| `smb-perf-gather`  | the whole box: host, CPU, memory, disks, pools, network, Samba, in sections |
 
 ## Recording
 
@@ -167,6 +169,122 @@ smb-perf-compare runs/*.json --per
 smb-perf-top new/ --diff old/ --ops --per 3000:file --base-per 3000:file
 ```
 
+## The storage underneath
+
+**smb-perf-disk** `[--interval T] [--pool NAME] [--share NAME]
+[--all-datasets] [--params] [-o FILE] [--json] [INPUT]` gathers what
+about the storage decides how long smbd waits for it, in one report:
+
+- the pools: size, allocation, fragmentation, ashift, layout (vdev
+  types by class), state, scrub or resilver status, errors;
+- the leaf vdevs and the disks under them: model, size, SSD or HDD,
+  bus, I/O scheduler, queue depth, error and slow-I/O counts, TRIM
+  state;
+- disk I/O over the interval (default 5 s), as iostat -x derives it
+  from /proc/diskstats, and `zpool iostat -l` per vdev: requests,
+  bytes and mean waits in total, at the disk, and in the sync and
+  async queues;
+- the ARC: size, target and limit, MRU and MFU, metadata, hit ratios
+  since boot and over the interval, L2ARC; the dbuf cache and
+  prefetch;
+- the ZIL: commits and bytes written synchronously, log blocks on the
+  data vdevs or on log devices; the transaction groups: dirty data,
+  sync time, the write throttle;
+- the shares, from testparm or from the configuration file when
+  testparm cannot run (a user without the registry), the dataset each
+  lives on, the settings that shape its I/O, and io_uring's sysctl;
+- the datasets under the shares and the pool roots (every filesystem
+  with `--all-datasets`): recordsize, compression, sync, logbias,
+  atime, xattr, dnodesize, acltype, casesensitivity, caching, special
+  blocks, copies, dedup, encryption, direct I/O, quotas; and per
+  dataset the reads, writes, unlinks and ZIL commits over the interval;
+- the ZFS module parameters that bear on this (all with `--params`)
+  and modprobe options;
+- notes on what in all that costs time: a scrub under way, a full or
+  fragmented pool, errors, ashift below the sector size, SSDs mixed
+  with HDDs in a vdev, untrimmed SSDs, sync=always without a log
+  device, sync=disabled, atime, directory xattrs, legacy dnodes with
+  xattr=sa, a case-sensitive dataset under a case-insensitive share,
+  dedup, the dirty-data throttle, a capped or thrashing ARC, swap.
+
+```
+smb-perf-disk                       # everything, sampled over 5 s
+smb-perf-disk --pool tank --share data --interval 10 -o before.json
+smb-perf-disk before.json           # print a saved run
+smb-perf-disk --interval 0 --json   # no sampling, everything as JSON
+```
+
+`-o FILE` keeps everything gathered, more than is printed, as JSON.
+Nothing needs root but testparm, which sees shares kept in Samba's
+registry and the defaults; without it the configuration file is read
+as written and the report says so.
+
+## The whole box
+
+**smb-perf-gather** `[SECTION...] [--interval T] [--pool NAME] [--share
+NAME] [--all-datasets] [--params] [-o FILE] [--json] [INPUT]` gathers
+what about the machine decides how smbd performs, all of it by default
+or the sections named (`--list` describes them):
+
+- **host**: kernel, OS, hardware (DMI), hypervisor or container,
+  uptime, boot options, perf and its sysctls, file and aio limits;
+- **cpu**: model, sockets, cores, SMT, NUMA nodes, caches, clock
+  policy, the mitigations in force; over the interval: user, system,
+  iowait, irq and steal shares, the busiest CPUs, context switches,
+  softirqs and the CPU each kind lands on, the busiest interrupt lines,
+  pressure stalls (PSI), the processes that used the most CPU;
+- **memory**: what memory holds (page cache, anonymous, slab, ARC),
+  commit, swap, transparent hugepages, the vm sysctls, each NUMA node;
+  over the interval: page faults, swapping, reclaim and allocation
+  stalls, compaction, OOM kills, pressure;
+- **disk**: every block device with model, size, bus, SATA or PCIe
+  link speed against its maximum, scheduler, queue depth, write cache,
+  error count, and what uses it; I/O rates and waits over the interval;
+  I/O pressure;
+- **pool**: everything `smb-perf-disk` reports about ZFS (same
+  options);
+- **net**: each interface with its kind, state, speed, MTU, driver,
+  queues, ring sizes against their maximum, coalescing, the offloads
+  on, interrupts a second and the CPUs taking them, addresses; over the
+  interval: traffic, drops and errors, the driver's own trouble
+  counters, TCP retransmits, timeouts, listen drops, receive-queue
+  pruning, memory pressure, softnet drops and squeezes; socket memory;
+  the TCP sysctls;
+- **smb**: Samba's daemons with threads, CPU over the interval, time
+  runnable but waiting for a CPU, preemptions, memory, open
+  descriptors, age and clients; the parent's open-file limit and
+  cgroup quotas with throttling; `smbstatus`: sessions with dialect,
+  encryption, signing and channels, tree connections, open files,
+  locks (root); every SMB connection as TCP sees it: RTT, cwnd,
+  retransmits, bytes, send and delivery rate, and the share of its
+  busy time it was held by the client's receive window or by smbd's
+  send buffer; the shares with their I/O settings; the effective
+  global settings that bear on performance (`testparm -v`, root);
+- **notes**, per section: one CPU saturated while the rest idle,
+  receive softirqs on one CPU, iowait or steal, memory running out or
+  swapping, reclaim and compaction stalls, a saturated or slow disk, a
+  SATA or PCIe link below its speed, a NIC linked below what it
+  supports, offloads off, missed and dropped packets, interrupts all on
+  one CPU, retransmits and timeouts, pruned receive queues, backlog
+  drops, TCP memory pressure, fixed socket buffers, old dialects,
+  encryption and signing, smbd waiting for a CPU, cgroup throttling, a
+  low open-file limit, profiling or logging turned up, and all of
+  `smb-perf-disk`'s notes.
+
+```
+smb-perf-gather                        # everything, sampled over 5 s
+smb-perf-gather cpu net smb --interval 10 -o busy.json
+smb-perf-gather busy.json net          # one section of a saved run
+smb-perf-gather --list
+```
+
+Nothing writes to the disks or the network: counters are read from
+/proc and /sys, ethtool and ss ask the kernel, and `zpool` commands
+read in-kernel state. Without root, `smbstatus` and `testparm` are not
+available and the report says so; each child smbd is still named after
+its client from the process title, and a connection is matched to its
+smbd when that client has one of each.
+
 ## Tests
 
 ```
@@ -177,5 +295,10 @@ Synthetic perf script output covers parsing, folding (stackcollapse-
 perf.pl's naming), off-CPU pairing, system calls, the event-loop cut,
 the SMB2 command split and every tool; the flame graph's script runs
 under node when installed; with root and perf, live recordings of a
-busy and a sleeping process. `tools/gen_syscalls.py` regenerates
+busy and a sleeping process. `smb-perf-disk`'s parsers run on zpool,
+zfs, kstat, diskstats and smb.conf text as the real ones print it, its
+notes on made-up trouble, and a live run with whatever the box has;
+`smb-perf-gather`'s readers on /proc/stat, softirqs, interrupts,
+ethtool, /proc/net, ss and smbstatus text, its notes on a box with
+something wrong in every section, and a live run. `tools/gen_syscalls.py` regenerates
 `smbperf/syscalls_gen.py` from a kernel tree.

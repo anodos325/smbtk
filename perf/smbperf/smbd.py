@@ -24,13 +24,17 @@ class Proc:
     cpu_s: float = 0.0
     started: float = 0.0
     clients: list[str] = field(default_factory=list)
+    title_client: str | None = None
 
     @property
     def name(self) -> str:
-        """smbd[client] with the whole address (comm keeps 15 bytes)."""
-        if self.clients and self.comm.startswith("smbd["):
-            return "smbd[" + ",".join(
-                sorted({host_of(c) for c in self.clients})) + "]"
+        """smbd[client] with the whole address (comm keeps 15 bytes): from
+        the connections when they can be seen, else from the title."""
+        if self.comm.startswith("smbd["):
+            hosts = sorted({host_of(c) for c in self.clients}) or (
+                [self.title_client] if self.title_client else [])
+            if hosts:
+                return "smbd[" + ",".join(hosts) + "]"
         return self.comm
 
 
@@ -44,6 +48,26 @@ def _boot_time() -> float:
         if line.startswith("btime "):
             return float(line.split()[1])
     return 0.0
+
+
+_TITLE = re.compile(r"smbd: client \[(.+)\]")
+
+
+def client_in_title(title: str) -> str | None:
+    """"smbd: client [10.1.2.3]" -> "10.1.2.3"."""
+    m = _TITLE.match(title.strip())
+    return m.group(1) if m else None
+
+
+def title_client(pid: int) -> str | None:
+    """The client address in a child smbd's process title; cmdline is
+    readable by anyone where /proc/<pid>/fd is the owner's only."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    return client_in_title(raw.split(b"\0", 1)[0].decode(errors="replace"))
 
 
 def processes(match=None) -> list[Proc]:
@@ -65,7 +89,9 @@ def processes(match=None) -> list[Proc]:
         out.append(Proc(
             pid=int(d), ppid=int(f[1]), comm=comm, threads=int(f[17]),
             cpu_s=(int(f[11]) + int(f[12])) / hz,
-            started=boot + int(f[19]) / hz))
+            started=boot + int(f[19]) / hz,
+            title_client=title_client(int(d)) if comm.startswith("smbd[")
+            else None))
     return sorted(out, key=lambda p: p.pid)
 
 
@@ -193,6 +219,8 @@ class Watcher:
                 "first_seen": now})
             e["comm"] = p.comm
             e["last_seen"] = now
+            if p.title_client:
+                e["title_client"] = p.title_client
             for c in p.clients:
                 if c not in e["clients"]:
                     e["clients"].append(c)
@@ -200,7 +228,8 @@ class Watcher:
     def names(self) -> dict[int, str]:
         out = {}
         for pid, e in self.seen.items():
-            hosts = sorted({host_of(c) for c in e["clients"]})
+            hosts = sorted({host_of(c) for c in e["clients"]}) or (
+                [e["title_client"]] if e.get("title_client") else [])
             if hosts and e["comm"].startswith("smbd["):
                 out[pid] = "smbd[" + ",".join(hosts) + "]"
         return out
@@ -302,3 +331,131 @@ def command(stack: tuple[str, ...]) -> str:
     if len(names) > 1 and names[1] not in _ENTRY and names[1] != LOOP:
         return "incomplete stack"
     return "other"
+
+
+# -- Samba's daemons and smbstatus ---------------------------------------------
+
+SAMBA_COMMS = ("smbd", "winbindd", "nmbd", "samba", "rpcd_", "ctdbd", "lpqd")
+
+
+def is_samba(comm: str) -> bool:
+    return comm == "smbd" or comm.startswith(SAMBA_COMMS)
+
+
+def samba_processes(ports=SMB_PORTS) -> list[Proc]:
+    """Every Samba daemon, smbd's with their clients."""
+    procs = processes(is_samba)
+    cl = clients([p.pid for p in procs if is_smbd(p.comm)], ports)
+    for p in procs:
+        p.clients = sorted(cl.get(p.pid, []))
+    return procs
+
+
+def _degree(d) -> str | None:
+    """smbstatus's {"cipher": ..., "degree": ...} as one word or two."""
+    if not isinstance(d, dict):
+        return None
+    degree, cipher = d.get("degree"), d.get("cipher")
+    if degree is None:
+        return None
+    return f"{degree} ({cipher})" if cipher and cipher != "-" else str(degree)
+
+
+def _address(text: str | None) -> str | None:
+    """ipv4:10.1.2.3:51234 -> 10.1.2.3."""
+    if not text:
+        return None
+    for prefix in ("ipv4:", "ipv6:"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+    return text.rsplit(":", 1)[0] if ":" in text else text
+
+
+def summarize_status(data: dict) -> dict:
+    """What matters for performance in smbstatus --json: each session's
+    user, client, dialect, encryption, signing and channels; tree
+    connections per share; how many files are open and locked."""
+    out: dict = {"version": data.get("version"),
+                 "timestamp": data.get("timestamp"), "sessions": [],
+                 "tcons": [], "open_files": None, "locks": None,
+                 "shares": {}}
+    sessions = data.get("sessions")
+    for sid, s in (sessions.items() if isinstance(sessions, dict) else []):
+        if not isinstance(s, dict):
+            continue
+        chans = s.get("channels")
+        chans = list(chans.values()) if isinstance(chans, dict) else []
+        out["sessions"].append({
+            "id": s.get("session_id", sid),
+            "pid": (s.get("server_id") or {}).get("pid"),
+            "user": s.get("username"), "group": s.get("groupname"),
+            "machine": s.get("remote_machine"), "hostname": s.get("hostname"),
+            "dialect": s.get("session_dialect"),
+            "encryption": _degree(s.get("encryption")),
+            "signing": _degree(s.get("signing")),
+            "channels": len(chans),
+            "addresses": sorted({_address(c.get("remote_address"))
+                                 for c in chans if isinstance(c, dict)
+                                 and c.get("remote_address")}),
+            "since": s.get("creation_time")})
+    tcons = data.get("tcons")
+    for tid, t in (tcons.items() if isinstance(tcons, dict) else []):
+        if not isinstance(t, dict):
+            continue
+        share = t.get("service")
+        out["tcons"].append({
+            "id": t.get("tcon_id", tid), "share": share,
+            "session": t.get("session_id"),
+            "pid": (t.get("server_id") or {}).get("pid"),
+            "machine": t.get("machine"),
+            "encryption": _degree(t.get("encryption")),
+            "signing": _degree(t.get("signing")),
+            "since": t.get("connected_at")})
+        e = out["shares"].setdefault(share, {"tcons": 0, "open_files": 0})
+        e["tcons"] += 1
+    files = data.get("open_files")
+    if isinstance(files, dict):
+        n = 0
+        for f in files.values():
+            opens = f.get("opens") if isinstance(f, dict) else None
+            k = len(opens) if isinstance(opens, dict) else 1
+            n += k
+            svc = f.get("service_path") if isinstance(f, dict) else None
+            if svc:
+                e = out["shares"].setdefault(svc, {"tcons": 0, "open_files": 0})
+                e["open_files"] += k
+        out["open_files"] = n
+    locks = data.get("byte_range_locks")
+    if isinstance(locks, dict):
+        out["locks"] = sum(len(v) if isinstance(v, (dict, list)) else 1
+                           for v in locks.values())
+    return out
+
+
+def smbstatus(smbstatus_bin: str = "smbstatus") -> dict:
+    """smbstatus --json, summarized; {"error": why} when it cannot run,
+    as it cannot for a user without access to Samba's databases."""
+    import json
+    import shutil
+    import subprocess
+    exe = shutil.which(smbstatus_bin)
+    if not exe:
+        return {"error": "smbstatus not found"}
+    try:
+        p = subprocess.run([exe, "--json"], capture_output=True, text=True,
+                           timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"error": f"smbstatus: {e}"}
+    text = p.stdout
+    start = text.find("{")
+    if p.returncode != 0 or start < 0:
+        err = [ln.strip() for ln in p.stderr.splitlines() if ln.strip()]
+        return {"error": "smbstatus: " + (err[0] if err else
+                                          f"exit {p.returncode}")}
+    try:
+        data = json.loads(text[start:])
+    except ValueError:
+        return {"error": "smbstatus: output is not JSON"}
+    out = summarize_status(data)
+    out["error"] = None
+    return out

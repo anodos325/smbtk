@@ -1,0 +1,76 @@
+#!/usr/bin/env bpftrace
+/*
+ * smbd-io-sizes.bt: how big smbd's reads and writes of file data are.
+ *
+ * With "aio read size = 0" and "aio write size = 0" smbd answers SMB2
+ * READ and WRITE with pread(2) and pwrite(2) from the client's own
+ * process: schedule_smb2_aio_read() and schedule_aio_smb2_write()
+ * return NT_STATUS_RETRY, read_file() and write_file() go down the VFS
+ * stack to vfs_default (vfs_io_uring implements only the _send paths),
+ * and sys_pread_full()/sys_pwrite_full() make the syscall. So the
+ * syscall sizes are the sizes the SMB layer asked for.
+ *
+ * Power-of-two histograms of the bytes requested and the bytes
+ * returned (they differ where reads hit end of file), calls and bytes
+ * per smbd process, and errors by errno. Reads served by sendfile(2)
+ * ("use sendfile = yes", unsigned and unencrypted) do not pass here.
+ *
+ * Usage:  bpftrace smbd-io-sizes.bt         # Ctrl-C prints the result
+ *         bpftrace smbd-io-sizes.bt PID     # one smbd process only
+ *
+ * Needs root and the syscalls tracepoints (CONFIG_FTRACE_SYSCALLS);
+ * TrueNAS 27 has them, with bpftrace 0.23.
+ */
+
+BEGIN
+{
+	if ($1) {
+		printf("Tracing pread/pwrite of smbd pid %d... Ctrl-C to end.\n", $1);
+	} else {
+		printf("Tracing pread/pwrite of smbd processes... Ctrl-C to end.\n");
+	}
+}
+
+tracepoint:syscalls:sys_enter_pread64
+/strncmp(comm, "smbd", 4) == 0 && ($1 == 0 || pid == $1) && args.count > 0/
+{
+	@read_requested = hist(args.count);
+}
+
+tracepoint:syscalls:sys_exit_pread64
+/strncmp(comm, "smbd", 4) == 0 && ($1 == 0 || pid == $1)/
+{
+	if (args.ret > 0) {
+		@read_returned = hist(args.ret);
+		@calls[pid, comm, "read"] = count();
+		@bytes[pid, comm, "read"] = sum(args.ret);
+	} else if (args.ret == 0) {
+		@calls[pid, comm, "read at eof"] = count();
+	} else {
+		@errors[pid, comm, "read", -args.ret] = count();
+	}
+}
+
+tracepoint:syscalls:sys_enter_pwrite64
+/strncmp(comm, "smbd", 4) == 0 && ($1 == 0 || pid == $1) && args.count > 0/
+{
+	@write_requested = hist(args.count);
+}
+
+tracepoint:syscalls:sys_exit_pwrite64
+/strncmp(comm, "smbd", 4) == 0 && ($1 == 0 || pid == $1)/
+{
+	if (args.ret > 0) {
+		@write_returned = hist(args.ret);
+		@calls[pid, comm, "write"] = count();
+		@bytes[pid, comm, "write"] = sum(args.ret);
+	} else if (args.ret < 0) {
+		@errors[pid, comm, "write", -args.ret] = count();
+	}
+}
+
+END
+{
+	printf("\ntraced for %d s; sizes in bytes, per process: calls, bytes, errors by errno\n",
+	       elapsed / 1000000000);
+}

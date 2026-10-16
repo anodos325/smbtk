@@ -25,6 +25,22 @@ def fmt_dur(ns: float | None) -> str:
     return f"{ns / S:.3f}s"
 
 
+def fmt_bytes(n: float | None) -> str:
+    """Bytes in binary units as zfs prints them: 512B, 1.50K, 29.0G,
+    2.51T."""
+    if n is None:
+        return "-"
+    a = abs(n)
+    for div, suffix in ((1 << 50, "P"), (1 << 40, "T"), (1 << 30, "G"),
+                        (1 << 20, "M"), (1 << 10, "K")):
+        if a >= div:
+            v = n / div
+            if abs(v) >= 100:
+                return f"{v:.0f}{suffix}"
+            return f"{v:.1f}{suffix}" if abs(v) >= 10 else f"{v:.2f}{suffix}"
+    return f"{n:.0f}B"
+
+
 def fmt_si(v: float) -> str:
     a = abs(v)
     for div, suffix in ((1e12, "T"), (1e9, "G"), (1e6, "M"), (1e3, "K")):
@@ -129,3 +145,28 @@ def wall(perf_ns: int, tod_offset_ns: int | None) -> str:
     d = datetime.datetime.fromtimestamp((perf_ns + tod_offset_ns) / S,
                                         datetime.timezone.utc)
     return d.strftime("%Y-%m-%d %H:%M:%S.%f UTC")
+
+
+def wrap_items(prefix: str, items, sep: str = ", ", indent: str = "    ",
+               width: int = 100) -> str:
+    """`prefix` and the items on lines of at most `width` columns with
+    every item kept whole, where textwrap would break "tcp_rmem 4096
+    131072 33554432" or "aio read size = 1" at any space."""
+    lines: list[str] = []
+    line = prefix
+    first = True
+    for item in items:
+        if first:
+            if len(prefix) + len(item) > width and prefix.strip():
+                lines.append(prefix.rstrip())
+                line = indent + item
+            else:
+                line = prefix + item
+            first = False
+        elif len(line) + len(sep) + len(item) <= width:
+            line += sep + item
+        else:
+            lines.append(line + sep.rstrip())
+            line = indent + item
+    lines.append(line)
+    return "\n".join(lines)
